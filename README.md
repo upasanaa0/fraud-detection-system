@@ -8,7 +8,7 @@ Converted from a Colab notebook into a clean, modular VS Code project.
 ## Project Structure
 
 ```
-fraud_detection/
+fraud_detect/
 ├── main.py                    ← Entry point (run this)
 ├── requirements.txt
 ├── .vscode/
