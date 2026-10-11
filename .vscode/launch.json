@@ -1,0 +1,50 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Run Full Pipeline",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/main.py",
+            "args": ["--step", "all"],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Generate Data Only",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/main.py",
+            "args": ["--step", "generate"],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Train Models Only",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/main.py",
+            "args": ["--step", "train"],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Predict / Score Only",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/main.py",
+            "args": ["--step", "predict"],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Fast Dev Run (50k rows)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/main.py",
+            "args": [
+                "--step", "all",
+                "--train-rows", "50000",
+                "--prod-rows", "10000"
+            ],
+            "console": "integratedTerminal"
+        }
+    ]
+}

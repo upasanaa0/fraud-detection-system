@@ -1,8 +1,7 @@
-data/train.csv
-data/production.csv
+data/
+model/
 __pycache__/
 *.pyc
-*.pyo
+.venv/
 venv/
 .env
-.vscode/

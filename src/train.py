@@ -1,114 +1,81 @@
-import os
-import json
-import pandas as pd
+import json, os
 import joblib
+import numpy as np
+import pandas as pd
 import xgboost as xgb
 from sklearn.ensemble import IsolationForest
-from sklearn.model_selection import train_test_split, cross_val_score
-from imblearn.over_sampling import SMOTE
-from src.feature_engineering import (
-    add_lat_long, detect_state_change, detect_new_device,
-    detect_os_change, device_location_combo_risk,
-    add_user_profile_features, add_merchant_risk,
-    feature_engineering, drop_helper_columns, clean_nans, encode_objects,
-)
+from sklearn.metrics import average_precision_score, precision_recall_curve, roc_auc_score, roc_curve
+from src.features import BASE_FEATURES, apply_merchant_risk, build_features, merchant_table, oof_merchant_risk
 
-TRAIN_DROP_COLS = [
-    "travel_distance_km", "travel_speed_kmph", "impossible_travel_flag",
-    "txn_count_1hr", "amount_sum_1hr", "velocity_risk_flag",
-    "user_mean_amount", "user_std_amount", "user_txn_count", "user_max_amount",
-]
+SEED = 42
+XGB_PARAMS = dict(n_estimators=600, max_depth=5, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8,
+                  eval_metric="aucpr", early_stopping_rounds=40, tree_method="hist", random_state=SEED, n_jobs=-1)
 
 
-def build_train_features(df):
-    print("  Adding geo coordinates...")
-    df = add_lat_long(df)
-    print("  Detecting behavioural flags...")
-    df = detect_state_change(df)
-    df = detect_new_device(df)
-    df = detect_os_change(df)
-    df = device_location_combo_risk(df)
-    print("  Adding user profile features...")
-    df = add_user_profile_features(df)
-    print("  Adding merchant risk...")
-    df = add_merchant_risk(df)
-    print("  Feature engineering...")
-    df = feature_engineering(df)
-    print("  Dropping helper columns...")
-    df = drop_helper_columns(df)
-    for col in ["state", "city"]:
-        if col in df.columns:
-            df.drop(col, axis=1, inplace=True)
-    df = encode_objects(df)
-    df = clean_nans(df)
-    X = df.drop(["is_fraud", "timestamp"], axis=1)
-    y = df["is_fraud"]
-    for col in TRAIN_DROP_COLS:
-        if col in X.columns:
-            X.drop(col, axis=1, inplace=True)
-    X = encode_objects(X)
-    return X, y
+def pick_thresholds(y, p, target_precision=0.90, challenge_fpr=0.01):
+    """Choose tier thresholds on VALIDATION data only."""
+    fpr, tpr, thr = roc_curve(y, p)
+    t_challenge = float(thr[np.searchsorted(fpr, challenge_fpr, side="right") - 1])
+    prec, rec, pthr = precision_recall_curve(y, p)
+    ok = np.where(prec[:-1] >= target_precision)[0]
+    t_block = float(pthr[ok[0]]) if len(ok) else float(pthr[-1])
+    return {"challenge": min(t_challenge, t_block), "block": t_block}
 
 
 def train(data_path="data/train.csv", model_dir="model"):
     os.makedirs(model_dir, exist_ok=True)
+    df = build_features(pd.read_csv(data_path))                       # time-sorted, causal
+    cut = int(len(df) * 0.8)                                          # time-based split
+    fit, val = df.iloc[:cut].copy(), df.iloc[cut:].copy()
+    print(f"fit {len(fit):,} ({fit.timestamp.min():%Y-%m-%d}..{fit.timestamp.max():%Y-%m-%d}) | "
+          f"val {len(val):,} ({val.timestamp.min():%Y-%m-%d}..{val.timestamp.max():%Y-%m-%d}) | fraud rate {fit.is_fraud.mean():.2%}")
 
-    print(f"Loading training data from {data_path}...")
-    df = pd.read_csv(data_path)
-    print(f"Shape: {df.shape}")
+    # merchant risk: out-of-fold on fit rows, fit-table on val rows (no row sees its own label)
+    fit["merchant_risk"] = oof_merchant_risk(fit)
+    table, prior = merchant_table(fit)
+    val["merchant_risk"] = apply_merchant_risk(val, table, prior)
 
-    print("Building features...")
-    X, y = build_train_features(df)
-    print(f"Features: {len(X.columns)} columns")
-    print(f"Fraud rate: {y.mean():.2%}")
+    # Isolation Forest (unsupervised) -> anomaly score used as an extra feature
+    iso = IsolationForest(n_estimators=150, random_state=SEED, n_jobs=-1).fit(fit[BASE_FEATURES])
+    fit["iso_score"] = -iso.score_samples(fit[BASE_FEATURES])
+    val["iso_score"] = -iso.score_samples(val[BASE_FEATURES])
 
-    print("Applying SMOTE...")
-    smote = SMOTE(sampling_strategy=0.1, random_state=42)
-    X_res, y_res = smote.fit_resample(X, y)
+    results, models = {}, {}
+    for name, cols in {"xgb_only": BASE_FEATURES, "xgb_plus_iso": BASE_FEATURES + ["iso_score"]}.items():
+        m = xgb.XGBClassifier(**XGB_PARAMS)
+        m.fit(fit[cols], fit["is_fraud"], eval_set=[(val[cols], val["is_fraud"])], verbose=False)
+        p = m.predict_proba(val[cols])[:, 1]
+        results[name] = {"val_pr_auc": float(average_precision_score(val.is_fraud, p)),
+                         "val_roc_auc": float(roc_auc_score(val.is_fraud, p))}
+        models[name] = (m, cols, p)
+        print(f"{name:13s} val PR-AUC {results[name]['val_pr_auc']:.4f}  ROC-AUC {results[name]['val_roc_auc']:.4f}")
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_res, y_res, test_size=0.2, random_state=42
-    )
+    best = max(results, key=lambda k: results[k]["val_pr_auc"])
+    model, cols, pval = models[best]
+    print(f"selected: {best}")
 
-    print("Training XGBoost...")
-    xgb_model = xgb.XGBClassifier(
-        n_estimators=200,
-        max_depth=6,
-        learning_rate=0.1,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        tree_method="hist",
-        eval_metric="logloss",
-        verbosity=1
-    )
-    xgb_model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=50)
+    # leak check: a regularised model trained on shuffled labels must score ~0.5 AUC (mean of 3 seeds)
+    aucs = []
+    for sd in range(3):
+        ys = np.random.default_rng(sd).permutation(fit["is_fraud"].to_numpy())
+        chk = xgb.XGBClassifier(n_estimators=50, max_depth=5, learning_rate=0.1, min_child_weight=20,
+                                tree_method="hist", n_jobs=-1, random_state=sd)
+        chk.fit(fit[cols], ys)
+        aucs.append(roc_auc_score(val["is_fraud"], chk.predict_proba(val[cols])[:, 1]))
+    leak_auc = float(np.mean(aucs))
+    print(f"shuffled-label sanity check: val ROC-AUC {leak_auc:.3f} (mean of 3 seeds; should be ~0.5)")
 
-    print("Training Isolation Forest...")
-    iso_model = IsolationForest(
-        n_estimators=150,
-        contamination=0.03,
-        random_state=42,
-        n_jobs=-1
-    )
-    iso_model.fit(X_train)
+    thresholds = pick_thresholds(val.is_fraud.to_numpy(), pval)
+    print(f"thresholds (from validation): {thresholds}")
 
-    print("Running cross validation...")
-    cv_scores = cross_val_score(
-        xgb_model, X_res, y_res,
-        cv=3,
-        scoring="roc_auc",
-        n_jobs=-1
-    )
-    print(f"CV AUC: {cv_scores.mean():.4f} +/- {cv_scores.std():.4f}")
-
-    print("Saving models...")
-    joblib.dump(xgb_model, f"{model_dir}/xgb_model.pkl")
-    joblib.dump(iso_model,  f"{model_dir}/iso_model.pkl")
-    with open(f"{model_dir}/feature_columns.json", "w") as f:
-        json.dump(X_train.columns.tolist(), f)
-
-    print("Models saved successfully.")
-    print(f"CV AUC Score: {cv_scores.mean():.4f}")
+    joblib.dump(model, f"{model_dir}/xgb_model.pkl")
+    joblib.dump(iso, f"{model_dir}/iso_model.pkl")
+    joblib.dump({"table": table, "prior": prior}, f"{model_dir}/merchant_risk.pkl")
+    json.dump({"features": cols, "use_iso": best == "xgb_plus_iso", "thresholds": thresholds,
+               "validation": results, "shuffled_label_auc": leak_auc},
+              open(f"{model_dir}/config.json", "w"), indent=2)
+    json.dump(thresholds, open(f"{model_dir}/thresholds.json", "w"))
+    print("saved models + config")
 
 
 if __name__ == "__main__":
